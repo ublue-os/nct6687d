@@ -1,0 +1,6 @@
+version: "1"
+rules:
+  - base: main
+    upstream: Fred78290:main
+    mergeMethod: merge
+    mergeUnstable: false
