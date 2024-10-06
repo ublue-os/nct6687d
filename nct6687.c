@@ -37,14 +37,26 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 
+#ifndef MIN
 #define MIN(a,b) (((a)<(b))?(a):(b))
+#endif
+
+#ifndef MAX
 #define MAX(a,b) (((a)>(b))?(a):(b))
+#endif
 
 enum kinds
 {
 	nct6683,
 	nct6686,
 	nct6687
+};
+
+enum pwm_enable
+{
+	manual_mode = 1,
+	// There are multiple automatic modes, none of which is configurable by this module yet.
+	firmware_mode = 99,
 };
 
 static bool force;
@@ -84,11 +96,12 @@ static const char *const nct6687_chip_names[] = {
 #define SIO_REG_ENABLE 0x30		 /* Logical device enable */
 #define SIO_REG_ADDR 0x60		 /* Logical device address (2 bytes) */
 
-#define SIO_NCT6683D_ID 0xc732
-#define SIO_NCT6686_ID 0xd440
-#define SIO_NCT6686D_ID 0xd441
-#define SIO_NCT6687_ID 0xd451 // 0xd592
-#define SIO_NCT6687D_ID 0xd592
+#define SIO_NCT6681_ID          0xb270  /* for later */
+#define SIO_NCT6683_ID          0xc730
+#define SIO_NCT6686_ID          0xd440
+#define SIO_NCT6687D_ID         0xd450  /* NCT6687 ???*/
+#define SIO_NCT6687_ID          0xd590
+#define SIO_ID_MASK             0xFFF0
 
 static inline void superio_outb(int ioreg, int reg, int val)
 {
@@ -168,7 +181,8 @@ static inline void superio_exit(int ioreg)
 #define NCT6687_REG_FAN_CTRL_MODE(x) 0xA00
 #define NCT6687_REG_FAN_PWM_COMMAND(x) 0xA01
 #define NCT6687_FAN_CFG_REQ 0x80
-#define NCT6687_FAN_CFG_DONE 0x40
+//#define NCT6687_FAN_CFG_DONE          0x40    //! for 6683 returns auto mode and clears 0xA00, 0xA28-0xA2F registers
+#define NCT6687_FAN_CFG_DONE            0x00    //! tested on 6683 6687
 
 #define NCT6687_REG_BUILD_YEAR 0x604
 #define NCT6687_REG_BUILD_MONTH 0x605
@@ -318,6 +332,7 @@ struct nct6687_data
 	const struct attribute_group *groups[6];
 
 	struct mutex update_lock;	/* used to protect sensor updates */
+	struct mutex EC_io_lock;	/* used to protect EC io */
 	bool valid;					/* true if following fields are valid */
 	unsigned long last_updated; /* In jiffies */
 
@@ -334,6 +349,7 @@ struct nct6687_data
 	bool _restoreDefaultFanControlRequired[NCT6687_NUM_REG_FAN];
 
 	u8 pwm[NCT6687_NUM_REG_PWM];
+	enum pwm_enable pwm_enable[NCT6687_NUM_REG_PWM];
 
 	/* Remember extra register values over suspend/resume */
 	u8 hwm_cfg;
@@ -501,11 +517,11 @@ static u16 nct6687_read(struct nct6687_data *data, u16 address)
 	u8 page = (u8)(address >> 8);
 	u8 index = (u8)(address & 0xFF);
 	int res;
-
+	mutex_lock(&data->EC_io_lock);
 	outb_p(EC_SPACE_PAGE_SELECT, data->addr + EC_SPACE_PAGE_REGISTER_OFFSET);
 	outb_p(page, data->addr + EC_SPACE_PAGE_REGISTER_OFFSET);
 	outb_p(index, data->addr + EC_SPACE_INDEX_REGISTER_OFFSET);
-
+	mutex_unlock(&data->EC_io_lock);
 	res = inb_p(data->addr + EC_SPACE_DATA_REGISTER_OFFSET);
 
 	return res;
@@ -520,11 +536,12 @@ static void nct6687_write(struct nct6687_data *data, u16 address, u16 value)
 {
 	u8 page = (u8)(address >> 8);
 	u8 index = (u8)(address & 0xFF);
-
+	mutex_lock(&data->EC_io_lock);
 	outb_p(EC_SPACE_PAGE_SELECT, data->addr + EC_SPACE_PAGE_REGISTER_OFFSET);
 	outb_p(page, data->addr + EC_SPACE_PAGE_REGISTER_OFFSET);
 	outb_p(index, data->addr + EC_SPACE_INDEX_REGISTER_OFFSET);
 	outb_p(value, data->addr + EC_SPACE_DATA_REGISTER_OFFSET);
+	mutex_unlock(&data->EC_io_lock);
 }
 
 static void nct6687_update_temperatures(struct nct6687_data *data)
@@ -569,6 +586,16 @@ static void nct6687_update_voltage(struct nct6687_data *data)
 	pr_debug("nct6687_update_voltage\n");
 }
 
+static enum pwm_enable nct6687_get_pwm_enable(struct nct6687_data *data, int index)
+{
+	u16 bitMask = 0x01 << index;
+	if (nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index)) & bitMask)
+	{
+		return manual_mode;
+	}
+	return firmware_mode;
+}
+
 static void nct6687_update_fans(struct nct6687_data *data)
 {
 	int i;
@@ -587,6 +614,7 @@ static void nct6687_update_fans(struct nct6687_data *data)
 	for (i = 0; i < NCT6687_NUM_REG_PWM; i++)
 	{
 		data->pwm[i] = nct6687_read(data, NCT6687_REG_PWM(i));
+		data->pwm_enable[i] = nct6687_get_pwm_enable(data, i);
 
 		pr_debug("nct6687_update_fans[%d], pwm=%d", i, data->pwm[i]);
 	}
@@ -766,6 +794,8 @@ static ssize_t store_pwm(struct device *dev, struct device_attribute *attr, cons
 	struct nct6687_data *data = dev_get_drvdata(dev);
 	int index = sattr->index;
 	unsigned long val;
+	int retry;
+	u16 readback;
 	u16 mode;
 	u8 bitMask;
 
@@ -786,7 +816,61 @@ static ssize_t store_pwm(struct device *dev, struct device_attribute *attr, cons
 	msleep(50);
 	nct6687_write(data, NCT6687_REG_PWM_WRITE(index), val);
 	nct6687_write(data, NCT6687_REG_FAN_PWM_COMMAND(index), NCT6687_FAN_CFG_DONE);
-	msleep(50);
+
+	for (retry = 0; retry < 20; retry++) {
+		msleep(50);
+
+		readback = nct6687_read(data, NCT6687_REG_PWM(index));
+		if (readback == val)
+			break;
+	}
+	data->pwm[index] = readback;
+	data->pwm_enable[index] = nct6687_get_pwm_enable(data, index);
+
+	mutex_unlock(&data->update_lock);
+
+	return count;
+}
+
+static ssize_t show_pwm_enable(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct nct6687_data *data = nct6687_update_device(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+
+	return sprintf(buf, "%d\n", data->pwm_enable[sattr->nr]);
+}
+
+static ssize_t store_pwm_enable(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	struct nct6687_data *data = dev_get_drvdata(dev);
+	int index = sattr->nr;
+	unsigned long val;
+	u16 mode;
+	u8 bitMask;
+
+	if (index >= NCT6687_NUM_REG_FAN || kstrtoul(buf, 10, &val))
+		return -EINVAL;
+	if (val != manual_mode && val != firmware_mode)
+		return -EINVAL;
+
+	mutex_lock(&data->update_lock);
+
+	nct6687_save_fan_control(data, index);
+
+	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
+
+	bitMask = (u8)(0x01 << index);
+	if (val == manual_mode)
+	{
+		mode = (u8)(mode | bitMask);
+	}
+	else if (val == firmware_mode)
+	{
+		mode = (u8)(mode & ~bitMask);
+	}
+
+	nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
 
 	mutex_unlock(&data->update_lock);
 
@@ -794,6 +878,7 @@ static ssize_t store_pwm(struct device *dev, struct device_attribute *attr, cons
 }
 
 SENSOR_TEMPLATE(pwm, "pwm%d", S_IRUGO, show_pwm, store_pwm, 0);
+SENSOR_TEMPLATE_2(pwm_enable, "pwm%d_enable", S_IRUGO, show_pwm_enable, store_pwm_enable, 0, 0);
 
 static void nct6687_save_fan_control(struct nct6687_data *data, int index)
 {
@@ -815,7 +900,8 @@ static void nct6687_restore_fan_control(struct nct6687_data *data, int index)
 	if (data->_restoreDefaultFanControlRequired[index])
 	{
 		u8 mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
-		mode = (u8)(mode & ~data->_initialFanControlMode[index]);
+		u8 bitMask = 0x01 << index;
+		mode = (u8)((mode & ~bitMask) | data->_initialFanControlMode[index]);
 
 		nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
 
@@ -838,6 +924,7 @@ static umode_t nct6687_pwm_is_visible(struct kobject *kobj, struct attribute *at
 
 static struct sensor_device_template *nct6687_attributes_pwm_template[] = {
 	&sensor_dev_template_pwm,
+	&sensor_dev_template_pwm_enable,
 	NULL,
 };
 
@@ -941,8 +1028,14 @@ static void nct6687_setup_pwm(struct nct6687_data *data)
 	{
 		data->_initialFanPwmCommand[i] = nct6687_read(data, NCT6687_REG_FAN_PWM_COMMAND(i));
 		data->pwm[i] = nct6687_read(data, NCT6687_REG_PWM(i));
+		data->pwm_enable[i] = nct6687_get_pwm_enable(data, i);
 
-		pr_debug("nct6687_setup_pwm[%d], addr=%04X, pwm=%d, _initialFanPwmCommand=%d\n", i, NCT6687_REG_FAN_PWM_COMMAND(i), data->pwm[i], data->_initialFanPwmCommand[i]);
+		pr_debug("nct6687_setup_pwm[%d], addr=%04X, pwm=%d, pwm_enable=%d, _initialFanPwmCommand=%d\n",
+		         i,
+		         NCT6687_REG_FAN_PWM_COMMAND(i),
+		         data->pwm[i],
+		         data->pwm_enable[i],
+		         data->_initialFanPwmCommand[i]);
 	}
 }
 
@@ -990,7 +1083,7 @@ static int nct6687_probe(struct platform_device *pdev)
 	pr_debug("nct6687_probe addr=0x%04X, sioreg=0x%04X\n", data->addr, data->sioreg);
 
 	mutex_init(&data->update_lock);
-
+	mutex_init(&data->EC_io_lock);
 	platform_set_drvdata(pdev, data);
 
 	nct6687_init_device(data);
@@ -1074,6 +1167,8 @@ static int nct6687_resume(struct platform_device *pdev)
 
 #define NCT6687_DEV_PM_OPS NULL
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
 static struct platform_driver nct6687_driver = {
 	.driver = {
 		.name = DRVNAME,
@@ -1084,6 +1179,7 @@ static struct platform_driver nct6687_driver = {
 	.suspend = nct6687_suspend,
 	.resume = nct6687_resume,
 };
+#pragma GCC diagnostic pop
 
 static int __init nct6687_find(int sioaddr, struct nct6687_sio_data *sio_data)
 {
@@ -1100,20 +1196,26 @@ static int __init nct6687_find(int sioaddr, struct nct6687_sio_data *sio_data)
 
 	pr_debug("found chip ID: 0x%04x\n", val);
 
-	if (val == SIO_NCT6683D_ID) {
-		sio_data->kind = nct6683;
-	} else if (val == SIO_NCT6686_ID || val == SIO_NCT6686D_ID) {
-		sio_data->kind = nct6686;
-	} else if (val == SIO_NCT6687_ID || val == SIO_NCT6687D_ID || force)
-	{
-		sio_data->kind = nct6687;
-	}
-	else
-	{
-		if (val != 0xffff)
-			pr_debug("unsupported chip ID: 0x%04x\n", val);
-		goto fail;
-	}
+       switch (val & SIO_ID_MASK) {
+        case SIO_NCT6683_ID:
+                sio_data->kind = nct6683;
+                break;
+        case SIO_NCT6686_ID:
+                sio_data->kind = nct6686;
+                break;
+        case SIO_NCT6687D_ID:
+        case SIO_NCT6687_ID:
+                sio_data->kind = nct6687;
+                break;
+        default:
+		if (force){
+                 sio_data->kind = nct6687;
+                 break;
+		}
+                if (val != 0xffff)
+                        pr_debug("unsupported chip ID: 0x%04x\n", val);
+                goto fail;
+        }
 
 	/* We have a known chip, find the HWM I/O address */
 	superio_select(sioaddr, NCT6687_LD_HWM);

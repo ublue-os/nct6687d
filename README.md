@@ -9,7 +9,8 @@ The implementation is minimalist and was done by reverse coding of Windows 10 so
 <br><br>
 
 ## Installation
-### .deb package
+### via package manager
+#### .deb package
 - Clone this repository
 ```shell
 ~$ git clone https://github.com/Fred78290/nct6687d
@@ -25,7 +26,7 @@ The implementation is minimalist and was done by reverse coding of Windows 10 so
 ```
 <br>
 
-### .rpm package (akmod)
+#### .rpm package (akmod)
 - Clone this repository
 ```shell
 ~$ git clone https://github.com/Fred78290/nct6687d
@@ -37,10 +38,10 @@ The implementation is minimalist and was done by reverse coding of Windows 10 so
 ```
 <br><br>
 
-## Manual Install
-### Dependencies:
+### Manual Install
+#### Dependencies:
 - Ubuntu/Debian:
-	 ```apt-get install build-essential linux-headers-$(uname -r) dkms```
+	 ```apt-get install build-essential linux-headers-$(uname -r) dkms dh-dkms```
 - Fedora/CentOS/RHEL:
 	```yum install make automake gcc gcc-c++ kernel-devel kernel-headers dkms```
 - ArchLinux:
@@ -49,7 +50,7 @@ The implementation is minimalist and was done by reverse coding of Windows 10 so
 	 ```zypper in git make gcc dkms```
 <br>
 
-### Build with DKMS
+#### Build with DKMS
 ```shell
 ~$ git clone https://github.com/Fred78290/nct6687d
 ~$ cd nct6687d
@@ -57,7 +58,7 @@ The implementation is minimalist and was done by reverse coding of Windows 10 so
 ```
 <br>
 
-### Manual build
+#### Manual build
 ```shell
 ~$ git clone (this-repo)
 ~$ cd nct6687d
@@ -122,7 +123,7 @@ Just add nct6687 into /etc/modules
 
 ## Tested
 
-This module was tested on Ubuntu 20.04 with all kernel availble on motherboard [MAG-B550-TOMAHAWK](https://www.msi.com//Motherboard/MAG-B550-TOMAHAWK) running an [AMD 3900X/AMD 5900X](https://www.amd.com/en/products/cpu/amd-ryzen-9-3900x)
+This module was tested on Ubuntu 20.04 with all kernel available on motherboard [MAG-B550-TOMAHAWK](https://www.msi.com//Motherboard/MAG-B550-TOMAHAWK) running an [AMD 3900X/AMD 5900X](https://www.amd.com/en/products/cpu/amd-ryzen-9-3900x), and on RL8(RHEL8) [MAG-B550M-MORTAR](https://www.msi.com/Motherboard/MAG-B550M-MORTAR) running an [AMD 5700G](https://www.amd.com/en/products/apu/amd-ryzen-7-5700g)
 
 <br>
 
@@ -134,6 +135,7 @@ This module was tested on Ubuntu 20.04 with all kernel availble on motherboard [
 
 - Add support for MSI B460M Bazooka having NCT6687 with another device ID
 - Add support to use generic voltage input without multiplier, allows sensors custom conf
+- Support giving fan control back to the firmware
 <br>
 
 ## VOLTAGE MANUAL CONFIGURATION
@@ -184,7 +186,103 @@ chip "nct6687-*"
     compute in4       (@ * 2), (@ / 2)
 ```
 
+## MODULE PARAMETERS
+
+- **force** (bool) (default: false)
+  Set to enable support for unknown vendors.
+
+- **manual** (bool) (default: false)
+  Set voltage input and voltage label configured with external sensors file.
+  You can use custom labels and ignore inputs without setting this option if
+  you can figure out their names (see which `*_label` contains builtin label).
+
+## CONFIGURATION VIA SYSFS
+
+In order to be able to use this interface you need to know the path as which
+it's published. The path isn't fixed and depends on the order in which chips are
+registered by the kernel. One way to find it is by device class (`hwmon`) via a
+simple command like this:
+```
+for d in /sys/class/hwmon/*; do echo "$d: $(cat "$d/name")"; done | grep nct6687
+```
+
+Possible output:
+```
+/sys/class/hwmon/hwmon5: nct6687
+```
+
+This means that your base path for examples below is `/sys/class/hwmon/hwmon5`
+(note that adding/removing hardware can change the path, drop `grep` from the
+command above to see all sensors and their relative ordering).
+
+Another way to look it up is by a device (class path actually just points to
+device path) like in:
+
+`cd /sys/devices/platform/nct6687.*/hwmon/hwmon*`
+
+The first asterisk will be expanded to an address (`2592` which is `0xa20` that
+you can see in `sensors` output) and the second one to a number like `5` from
+above.
+
+### `pwm[1-8]`
+
+Gets/sets PWM duty cycle or DC value that defines fan speed.  Which unit is used
+depends on what was configured by firmware.
+
+Accepted values: `0`-`255` (slowest to full speed).
+
+Writing to this file changes fan control to manual mode.
+
+Example:
+
+```
+# slow down a fan as much as possible (will stop it if the fan supports zero RPM mode)
+echo 0 > pwm6
+# fix a fan at around half its speed (actual behaviour depends on the fan)
+echo 128 > pwm6
+# full speed
+echo 255 > pwm6
+```
+
+### `pwm[1-8]_enable`
+
+Gets/sets controls mode of fan/temperature control.
+
+Accepted values:
+ * `1` - manual speed management through `pwm[1-8]`
+ * `99` - whatever automatic mode was configured by firmware
+          (this is a deliberately weird value to be dropped after adding more
+           modes)
+
+Example:
+
+```
+# fix a fan at current speed (`echo pwm6` will be constant from now on)
+echo 1 > pwm6_enable
+# switch back to automatic control set up by firmware (`echo pwm6` is again dynamic after this)
+echo 99 > pwm6_enable
+# switch to ~25% of max speed
+echo 64 > pwm6
+# automatic
+echo 99 > pwm6_enable
+# back to ~25% (it seems to be remembered)
+echo 1 > pwm6_enable
+```
+
 ## VERIFIED
 **1. Fan speed control**
 
-- Changing fan speed was tested succesfuly by users, see reported issue.
+- Changing fan speed was tested successfully by users, see in [reported issues](https://github.com/Fred78290/nct6687d/issues).
+
+## Issues
+### ACPI
+loading nct6687 fails. `journalctl` shows `ACPI: OSL: Resource conflict; ACPI support missing from driver?`:
+* add `acpi_enforce_resources=lax` as a kernel parameter
+
+### Loading fails during startup
+`dmesg` / `journalctl` shows 
+```
+kernel: nct6687: EC base I/O port unconfigured
+systemd-modules-load[339]: Failed to insert module 'nct6687': No such device
+```
+* add `softdep nct6687 pre: i2c_i801` to e.g. `/etc/modprobe.d/sensors.conf`.
